@@ -369,15 +369,15 @@ function Resolve-GroupObject {
 
     $escapedName = $trimmedIdentity.Replace("'", "''")
     $encodedFilter = [uri]::EscapeDataString("displayName eq '$escapedName'")
-    $matches = @(Get-GraphCollection -Uri "$script:GraphBaseUri/groups?%24filter=$encodedFilter&%24select=id,displayName")
-    if ($matches.Count -eq 0) {
+    $groupSearchResults = @(Get-GraphCollection -Uri "$script:GraphBaseUri/groups?%24filter=$encodedFilter&%24select=id,displayName")
+    if ($groupSearchResults.Count -eq 0) {
         throw "No group with the exact display name '$trimmedIdentity' was found. Try its object ID instead."
     }
-    if ($matches.Count -gt 1) {
-        $ids = ($matches | ForEach-Object { $_.id }) -join ', '
+    if ($groupSearchResults.Count -gt 1) {
+        $ids = ($groupSearchResults | ForEach-Object { $_.id }) -join ', '
         throw "More than one group is named '$trimmedIdentity'. Use one of these object IDs: $ids"
     }
-    return $matches[0]
+    return $groupSearchResults[0]
 }
 
 function Test-EmailAddress {
