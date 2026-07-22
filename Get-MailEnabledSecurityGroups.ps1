@@ -368,7 +368,9 @@ function Resolve-DirectMember {
         $arguments.Properties = @(
             'displayName', 'mail', 'mailNickname', 'objectClass', 'objectGUID', 'objectSid',
             'proxyAddresses', 'sAMAccountName', 'targetAddress', 'userPrincipalName',
-            'whenChanged', 'whenCreated', 'groupType'
+            'whenChanged', 'whenCreated', 'groupType', 'userAccountControl',
+            'msExchRecipientTypeDetails', 'msExchRecipientDisplayType',
+            'msExchRemoteRecipientType'
         )
         $directoryObject = Get-ADObject @arguments
         $script:ResolvedMemberObjects++
@@ -403,6 +405,21 @@ function New-MembershipRecord {
     $memberClass = [string](Get-PropertyValue -InputObject $member -Name 'ObjectClass')
     $memberMail = [string](Get-PropertyValue -InputObject $member -Name 'mail')
     $memberGroupType = Get-PropertyValue -InputObject $member -Name 'groupType'
+    $memberUserAccountControl = Get-PropertyValue -InputObject $member -Name 'userAccountControl'
+    $memberEnabled = $null
+    $memberAccountStatus = 'NotApplicable'
+    if ($memberClass -iin @('user', 'computer')) {
+        $memberAccountStatus = 'Unknown'
+        if ($null -ne $memberUserAccountControl) {
+            try {
+                $memberEnabled = (([int64]$memberUserAccountControl -band 2) -eq 0)
+                $memberAccountStatus = if ($memberEnabled) { 'Enabled' } else { 'Disabled' }
+            }
+            catch {
+                $memberAccountStatus = 'Unknown'
+            }
+        }
+    }
     $memberIsGroup = $memberClass -ieq 'group'
     $memberIsSecurityGroup = $memberIsGroup -and (Test-SecurityGroupType -GroupType $memberGroupType)
     $memberIsMailEnabledGroup = $memberIsGroup -and -not [string]::IsNullOrWhiteSpace($memberMail)
@@ -441,6 +458,12 @@ function New-MembershipRecord {
         MemberUserPrincipalName              = [string](Get-PropertyValue -InputObject $member -Name 'userPrincipalName')
         MemberTargetAddress                  = [string](Get-PropertyValue -InputObject $member -Name 'targetAddress')
         MemberSid                            = ConvertTo-ReportSid (Get-PropertyValue -InputObject $member -Name 'objectSid')
+        MemberEnabled                        = $memberEnabled
+        MemberAccountStatus                  = $memberAccountStatus
+        MemberUserAccountControl             = $memberUserAccountControl
+        MemberMsExchRecipientTypeDetails     = Get-PropertyValue -InputObject $member -Name 'msExchRecipientTypeDetails'
+        MemberMsExchRecipientDisplayType     = Get-PropertyValue -InputObject $member -Name 'msExchRecipientDisplayType'
+        MemberMsExchRemoteRecipientType      = Get-PropertyValue -InputObject $member -Name 'msExchRemoteRecipientType'
         MemberDistinguishedName              = $MemberDistinguishedName
         MemberIsGroup                        = $memberIsGroup
         MemberGroupCategory                  = if ($memberIsGroup) { if ($memberIsSecurityGroup) { 'Security' } else { 'Distribution' } } else { $null }
@@ -553,6 +576,9 @@ function Export-Reports {
         'MemberObjectGuid', 'MemberName', 'MemberDisplayName', 'MemberSamAccountName',
         'MemberObjectClass', 'MemberMail', 'MemberPrimarySmtpAddress',
         'MemberUserPrincipalName', 'MemberTargetAddress', 'MemberSid',
+        'MemberEnabled', 'MemberAccountStatus', 'MemberUserAccountControl',
+        'MemberMsExchRecipientTypeDetails', 'MemberMsExchRecipientDisplayType',
+        'MemberMsExchRemoteRecipientType',
         'MemberDistinguishedName', 'MemberIsGroup', 'MemberGroupCategory',
         'MemberGroupScope', 'MemberIsMailEnabledGroup', 'MemberIsMailEnabledSecurityGroup',
         'MemberIsInReportGroupSet', 'MemberWhenCreated', 'MemberWhenChanged',
@@ -722,6 +748,9 @@ try {
             else {
                 $memberLabel = if ([string]::IsNullOrWhiteSpace($relationship.MemberDisplayName)) { $memberDn } else { $relationship.MemberDisplayName }
                 $memberType = if ([string]::IsNullOrWhiteSpace($relationship.MemberObjectClass)) { 'unknown' } else { $relationship.MemberObjectClass }
+                if ($relationship.MemberAccountStatus -eq 'Disabled') {
+                    $memberType = "$memberType; account disabled"
+                }
                 Write-Log -Level INFO -Message "  [$memberIndex/$($memberDns.Count)] $($group.Name) -> $memberLabel [$memberType]"
 
                 switch ($relationship.MemberObjectClass.ToLowerInvariant()) {

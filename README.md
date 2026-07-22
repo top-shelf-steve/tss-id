@@ -127,7 +127,12 @@ The default `All` member scope produces three relational CSV datasets:
 
 Direct membership is used so nesting topology is preserved for diagramming. The member
 report identifies each member's object type and flags whether a nested group is itself a
-mail-enabled security group and whether it belongs to the report's source-group set.
+mail-enabled security group and whether it belongs to the report's source-group set. User
+and computer rows also include derived account status, raw `userAccountControl`, and the
+raw Exchange recipient attributes `msExchRecipientTypeDetails`,
+`msExchRecipientDisplayType`, and `msExchRemoteRecipientType`. Disabled accounts are
+retained; they are not automatically excluded because they may represent shared or resource
+mailboxes.
 
 ## Requirements
 
