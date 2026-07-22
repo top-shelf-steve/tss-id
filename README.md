@@ -109,3 +109,68 @@ shown as `<not registered>`.
 For non-interactive runs, either supply `-ExportPath` or use `-NoExportPrompt`.
 Exports are intentionally written during `-WhatIf` runs; dry-run mode prevents Microsoft
 Graph changes, while still allowing the requested results report to be saved.
+
+---
+
+# Mail-Enabled Security Group Report
+
+`Get-MailEnabledSecurityGroups.ps1` inventories on-premises Active Directory
+mail-enabled security groups and captures their direct membership relationships.
+
+The default `All` member scope produces three relational CSV datasets:
+
+- `MailEnabledSecurityGroups-*.csv`: one row per source group
+- `MailEnabledSecurityGroupMembers-*.csv`: one row per direct group-to-member relationship
+- `MailEnabledSecurityGroupNesting-*.csv`: the group-to-group relationship subset
+
+Direct membership is used so nesting topology is preserved for diagramming. The member
+report identifies each member's object type and flags whether a nested group is itself a
+mail-enabled security group and whether it belongs to the report's source-group set.
+
+## Requirements
+
+- Windows PowerShell 5.1 or PowerShell 7+
+- The `ActiveDirectory` PowerShell module from RSAT
+- Read access to the relevant on-premises Active Directory objects
+
+## Usage
+
+Capture all direct membership and export all three datasets:
+
+```powershell
+.\Get-MailEnabledSecurityGroups.ps1 -ExportPath C:\Reports
+```
+
+Capture only group nesting for a smaller diagram-focused dataset:
+
+```powershell
+.\Get-MailEnabledSecurityGroups.ps1 `
+    -MemberScope GroupsOnly `
+    -ExportPath C:\Reports
+```
+
+Run a small preview using the first 15 groups alphabetically and the first 15 direct
+member distinguished names from each group:
+
+```powershell
+.\Get-MailEnabledSecurityGroups.ps1 `
+    -TestMode `
+    -MemberScope GroupsOnly `
+    -ExportPath C:\Reports\Test
+```
+
+Use `-TestLimit 25` with `-TestMode` to choose a different sample size. Test inventory
+rows have `ReportMode=TestSample`; `DirectMemberCount` remains the true directory count,
+while `InspectedDirectMemberCount` and `MembershipWasTruncated` describe the sample.
+
+Inventory groups without resolving members:
+
+```powershell
+.\Get-MailEnabledSecurityGroups.ps1 `
+    -MemberScope None `
+    -SearchBase 'OU=Groups,DC=contoso,DC=com' `
+    -ExportPath C:\Reports
+```
+
+Omit `-ExportPath` to choose a directory after collection, or use `-NoExportPrompt` to
+collect and show the terminal summary without exporting.

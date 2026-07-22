@@ -1,0 +1,681 @@
+<#
+.SYNOPSIS
+Reports mail-enabled security groups and their direct Active Directory membership.
+
+.DESCRIPTION
+Queries on-premises Active Directory for security groups that have a mail attribute. The
+script exports relational CSV files that can be used for review, analysis, or diagramming:
+
+  * Groups: one row per mail-enabled security group.
+  * Members: one row per direct group-to-member relationship (MemberScope All only).
+  * GroupNesting: one row per direct group-to-group relationship.
+
+Direct membership is intentional. Recursively flattening membership would hide the group
+nesting relationships needed to build an accurate diagram. A security group with a mail
+value but a non-universal scope is included and flagged for review instead of silently
+excluded.
+
+.PARAMETER MemberScope
+All (default) captures every direct member and also produces the group-nesting subset.
+GroupsOnly captures only direct members that are groups. None produces only group inventory.
+
+.PARAMETER SearchBase
+Distinguished name at which to begin the group search. The domain default naming context is
+used when this is omitted.
+
+.PARAMETER Server
+Domain controller or AD LDS instance to query.
+
+.PARAMETER Credential
+Alternate credential used for all Active Directory queries.
+
+.PARAMETER TestMode
+Processes only the first TestLimit groups alphabetically and the first TestLimit direct
+member distinguished names in each selected group. CSV inventory rows explicitly identify
+the report as a test sample and show both available and inspected member counts.
+
+.PARAMETER TestLimit
+Maximum groups and direct members per selected group processed by TestMode. Defaults to 15.
+
+.PARAMETER ExportPath
+Directory to which timestamped CSV files are written. The directory is created if needed.
+When omitted, the script offers to export after collection completes.
+
+.PARAMETER NoExportPrompt
+Does not prompt for an export directory when ExportPath is omitted.
+
+.EXAMPLE
+.\Get-MailEnabledSecurityGroups.ps1 -ExportPath C:\Reports
+
+Captures every direct member and writes group, member, and group-nesting CSV files.
+
+.EXAMPLE
+.\Get-MailEnabledSecurityGroups.ps1 -MemberScope GroupsOnly -ExportPath C:\Reports
+
+Captures only group-to-group relationships, which is the smallest useful diagram dataset.
+
+.EXAMPLE
+.\Get-MailEnabledSecurityGroups.ps1 -TestMode -MemberScope GroupsOnly -ExportPath C:\Reports\Test
+
+Produces a small sample using at most 15 groups and 15 direct members from each group.
+
+.EXAMPLE
+.\Get-MailEnabledSecurityGroups.ps1 -MemberScope None -SearchBase 'OU=Groups,DC=contoso,DC=com'
+
+Creates an inventory without resolving member objects.
+
+.NOTES
+Requires Windows PowerShell 5.1 or PowerShell 7+ and the ActiveDirectory module (RSAT).
+"Mail-enabled" is determined from on-premises AD as GroupCategory=Security plus a non-empty
+mail attribute. This is an AD attribute report; it does not validate the objects against an
+Exchange recipient directory.
+#>
+
+#Requires -Version 5.1
+
+[CmdletBinding()]
+param(
+    [ValidateSet('All', 'GroupsOnly', 'None')]
+    [string]$MemberScope = 'All',
+
+    [ValidateNotNullOrEmpty()]
+    [string]$SearchBase,
+
+    [ValidateNotNullOrEmpty()]
+    [string]$Server,
+
+    [System.Management.Automation.PSCredential]$Credential,
+
+    [switch]$TestMode,
+
+    [ValidateRange(1, 1000)]
+    [int]$TestLimit = 15,
+
+    [ValidateNotNullOrEmpty()]
+    [string]$ExportPath,
+
+    [switch]$NoExportPrompt
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+$script:RunStarted = Get-Date
+$script:RunStamp = $script:RunStarted.ToString('yyyyMMdd-HHmmss')
+$script:GroupRecords = New-Object 'System.Collections.Generic.List[object]'
+$script:MemberRecords = New-Object 'System.Collections.Generic.List[object]'
+$script:NestingRecords = New-Object 'System.Collections.Generic.List[object]'
+$script:MemberCache = @{}
+$script:ReportGroupDns = @{}
+$script:MembershipFailures = 0
+$script:ResolvedMemberObjects = 0
+$script:MatchingGroupCount = 0
+
+function Write-Log {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('INFO', 'SUCCESS', 'WARN', 'ERROR', 'DEBUG', 'STEP')]
+        [string]$Level,
+
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
+
+    $color = switch ($Level) {
+        'SUCCESS' { 'Green' }
+        'WARN'    { 'Yellow' }
+        'ERROR'   { 'Red' }
+        'DEBUG'   { 'DarkGray' }
+        'STEP'    { 'Cyan' }
+        default   { 'Gray' }
+    }
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
+}
+
+function Get-PropertyValue {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object]$InputObject,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
+}
+
+function ConvertTo-ReportDate {
+    [CmdletBinding()]
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    try {
+        return ([datetime]$Value).ToString('o')
+    }
+    catch {
+        return [string]$Value
+    }
+}
+
+function ConvertTo-ReportGuid {
+    [CmdletBinding()]
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    return ([string]$Value).Trim('{}')
+}
+
+function ConvertTo-ReportSid {
+    [CmdletBinding()]
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    $sidValue = Get-PropertyValue -InputObject $Value -Name 'Value'
+    if (-not [string]::IsNullOrWhiteSpace([string]$sidValue)) {
+        return [string]$sidValue
+    }
+    return [string]$Value
+}
+
+function Get-PrimarySmtpAddress {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object]$ProxyAddresses,
+        [AllowNull()][string]$Mail
+    )
+
+    foreach ($address in @($ProxyAddresses)) {
+        if ([string]$address -clike 'SMTP:*') {
+            return ([string]$address).Substring(5)
+        }
+    }
+    return $Mail
+}
+
+function Test-SecurityGroupType {
+    [CmdletBinding()]
+    param([AllowNull()][object]$GroupType)
+
+    if ($null -eq $GroupType) {
+        return $false
+    }
+    try {
+        return (([int64]$GroupType -band [int64]2147483648) -ne 0)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-GroupScopeFromType {
+    [CmdletBinding()]
+    param([AllowNull()][object]$GroupType)
+
+    if ($null -eq $GroupType) {
+        return $null
+    }
+    try {
+        $value = [int64]$GroupType
+        if (($value -band 8) -ne 0) { return 'Universal' }
+        if (($value -band 4) -ne 0) { return 'DomainLocal' }
+        if (($value -band 2) -ne 0) { return 'Global' }
+    }
+    catch {
+        return $null
+    }
+    return 'Unknown'
+}
+
+function Get-AdConnectionArguments {
+    [CmdletBinding()]
+    param()
+
+    $arguments = @{ ErrorAction = 'Stop' }
+    if (-not [string]::IsNullOrWhiteSpace($Server)) {
+        $arguments.Server = $Server
+    }
+    if ($null -ne $Credential) {
+        $arguments.Credential = $Credential
+    }
+    return $arguments
+}
+
+function Resolve-DirectMember {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$DistinguishedName)
+
+    if ($script:MemberCache.ContainsKey($DistinguishedName)) {
+        Write-Log -Level DEBUG -Message "Using cached directory object '$DistinguishedName'."
+        return $script:MemberCache[$DistinguishedName]
+    }
+
+    $result = $null
+    try {
+        $arguments = Get-AdConnectionArguments
+        $arguments.Identity = $DistinguishedName
+        $arguments.Properties = @(
+            'displayName', 'mail', 'mailNickname', 'objectClass', 'objectGUID', 'objectSid',
+            'proxyAddresses', 'sAMAccountName', 'targetAddress', 'userPrincipalName',
+            'whenChanged', 'whenCreated', 'groupType'
+        )
+        $directoryObject = Get-ADObject @arguments
+        $script:ResolvedMemberObjects++
+        $result = [pscustomobject]@{
+            Status = 'Resolved'
+            Object = $directoryObject
+            Error  = $null
+        }
+    }
+    catch {
+        $script:MembershipFailures++
+        $result = [pscustomobject]@{
+            Status = 'Failed'
+            Object = $null
+            Error  = $_.Exception.Message
+        }
+    }
+
+    $script:MemberCache[$DistinguishedName] = $result
+    return $result
+}
+
+function New-MembershipRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$ParentGroup,
+        [Parameter(Mandatory)][string]$MemberDistinguishedName,
+        [Parameter(Mandatory)][object]$Resolution
+    )
+
+    $member = $Resolution.Object
+    $memberClass = [string](Get-PropertyValue -InputObject $member -Name 'ObjectClass')
+    $memberMail = [string](Get-PropertyValue -InputObject $member -Name 'mail')
+    $memberGroupType = Get-PropertyValue -InputObject $member -Name 'groupType'
+    $memberIsGroup = $memberClass -ieq 'group'
+    $memberIsSecurityGroup = $memberIsGroup -and (Test-SecurityGroupType -GroupType $memberGroupType)
+    $memberIsMailEnabledSecurityGroup = $memberIsSecurityGroup -and -not [string]::IsNullOrWhiteSpace($memberMail)
+    $memberIsReportGroup = $script:ReportGroupDns.ContainsKey($MemberDistinguishedName)
+    $memberName = [string](Get-PropertyValue -InputObject $member -Name 'Name')
+    $memberDisplayName = [string](Get-PropertyValue -InputObject $member -Name 'displayName')
+    if ([string]::IsNullOrWhiteSpace($memberDisplayName)) {
+        $memberDisplayName = $memberName
+    }
+    $parentDirectMemberCount = @((Get-PropertyValue -InputObject $ParentGroup -Name 'member')).Count
+    $parentInspectedMemberCount = $parentDirectMemberCount
+    if ($TestMode) {
+        $parentInspectedMemberCount = [math]::Min($parentDirectMemberCount, $TestLimit)
+    }
+
+    [pscustomobject][ordered]@{
+        ReportMode                           = if ($TestMode) { 'TestSample' } else { 'Full' }
+        ParentDirectMemberCount              = $parentDirectMemberCount
+        ParentInspectedMemberCount           = $parentInspectedMemberCount
+        ParentMembershipWasTruncated         = $TestMode -and $parentDirectMemberCount -gt $TestLimit
+        ParentGroupObjectGuid                = ConvertTo-ReportGuid (Get-PropertyValue -InputObject $ParentGroup -Name 'ObjectGUID')
+        ParentGroupName                      = [string](Get-PropertyValue -InputObject $ParentGroup -Name 'Name')
+        ParentGroupDisplayName               = [string](Get-PropertyValue -InputObject $ParentGroup -Name 'DisplayName')
+        ParentGroupSamAccountName            = [string](Get-PropertyValue -InputObject $ParentGroup -Name 'SamAccountName')
+        ParentGroupMail                      = [string](Get-PropertyValue -InputObject $ParentGroup -Name 'mail')
+        ParentGroupDistinguishedName         = [string](Get-PropertyValue -InputObject $ParentGroup -Name 'DistinguishedName')
+        MemberObjectGuid                     = ConvertTo-ReportGuid (Get-PropertyValue -InputObject $member -Name 'ObjectGUID')
+        MemberName                           = $memberName
+        MemberDisplayName                    = $memberDisplayName
+        MemberSamAccountName                 = [string](Get-PropertyValue -InputObject $member -Name 'sAMAccountName')
+        MemberObjectClass                    = $memberClass
+        MemberMail                           = $memberMail
+        MemberPrimarySmtpAddress             = Get-PrimarySmtpAddress -ProxyAddresses (Get-PropertyValue -InputObject $member -Name 'proxyAddresses') -Mail $memberMail
+        MemberUserPrincipalName              = [string](Get-PropertyValue -InputObject $member -Name 'userPrincipalName')
+        MemberTargetAddress                  = [string](Get-PropertyValue -InputObject $member -Name 'targetAddress')
+        MemberSid                            = ConvertTo-ReportSid (Get-PropertyValue -InputObject $member -Name 'objectSid')
+        MemberDistinguishedName              = $MemberDistinguishedName
+        MemberIsGroup                        = $memberIsGroup
+        MemberGroupCategory                  = if ($memberIsGroup) { if ($memberIsSecurityGroup) { 'Security' } else { 'Distribution' } } else { $null }
+        MemberGroupScope                     = if ($memberIsGroup) { Get-GroupScopeFromType -GroupType $memberGroupType } else { $null }
+        MemberIsMailEnabledSecurityGroup     = $memberIsMailEnabledSecurityGroup
+        MemberIsInReportGroupSet             = $memberIsReportGroup
+        MemberWhenCreated                    = ConvertTo-ReportDate (Get-PropertyValue -InputObject $member -Name 'whenCreated')
+        MemberWhenChanged                    = ConvertTo-ReportDate (Get-PropertyValue -InputObject $member -Name 'whenChanged')
+        MembershipResolutionStatus           = [string]$Resolution.Status
+        MembershipResolutionError            = [string]$Resolution.Error
+    }
+}
+
+function New-GroupInventoryRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Group,
+        [Parameter(Mandatory)][string]$MembershipStatus,
+        [AllowNull()][string]$MembershipError,
+        [AllowNull()][object]$Counts
+    )
+
+    $mail = [string](Get-PropertyValue -InputObject $Group -Name 'mail')
+    $scope = [string](Get-PropertyValue -InputObject $Group -Name 'GroupScope')
+
+    [pscustomobject][ordered]@{
+        ReportMode                      = if ($TestMode) { 'TestSample' } else { 'Full' }
+        GroupObjectGuid                 = ConvertTo-ReportGuid (Get-PropertyValue -InputObject $Group -Name 'ObjectGUID')
+        Name                            = [string](Get-PropertyValue -InputObject $Group -Name 'Name')
+        DisplayName                     = [string](Get-PropertyValue -InputObject $Group -Name 'DisplayName')
+        SamAccountName                  = [string](Get-PropertyValue -InputObject $Group -Name 'SamAccountName')
+        Mail                            = $mail
+        PrimarySmtpAddress              = Get-PrimarySmtpAddress -ProxyAddresses (Get-PropertyValue -InputObject $Group -Name 'proxyAddresses') -Mail $mail
+        MailNickname                    = [string](Get-PropertyValue -InputObject $Group -Name 'mailNickname')
+        GroupCategory                   = [string](Get-PropertyValue -InputObject $Group -Name 'GroupCategory')
+        GroupScope                      = $scope
+        ScopeAssessment                 = if ($scope -eq 'Universal') { 'Expected' } else { 'ReviewNonUniversalMailSecurityGroup' }
+        Description                     = [string](Get-PropertyValue -InputObject $Group -Name 'Description')
+        ManagedBy                       = [string](Get-PropertyValue -InputObject $Group -Name 'ManagedBy')
+        DistinguishedName               = [string](Get-PropertyValue -InputObject $Group -Name 'DistinguishedName')
+        DirectMemberCount               = if ($null -ne $Counts) { $Counts.DirectoryTotal } else { @((Get-PropertyValue -InputObject $Group -Name 'member')).Count }
+        InspectedDirectMemberCount      = if ($null -ne $Counts) { $Counts.Total } else { $null }
+        MembershipWasTruncated          = if ($null -ne $Counts) { $Counts.WasTruncated } else { $null }
+        DirectGroupMemberCount          = if ($null -ne $Counts) { $Counts.Group } else { $null }
+        DirectUserMemberCount           = if ($null -ne $Counts) { $Counts.User } else { $null }
+        DirectComputerMemberCount       = if ($null -ne $Counts) { $Counts.Computer } else { $null }
+        DirectContactMemberCount        = if ($null -ne $Counts) { $Counts.Contact } else { $null }
+        DirectForeignPrincipalCount     = if ($null -ne $Counts) { $Counts.ForeignSecurityPrincipal } else { $null }
+        DirectOtherMemberCount          = if ($null -ne $Counts) { $Counts.Other } else { $null }
+        UnresolvedMemberCount           = if ($null -ne $Counts) { $Counts.Unresolved } else { $null }
+        MembershipInspectionStatus      = $MembershipStatus
+        MembershipInspectionError       = $MembershipError
+        WhenCreated                     = ConvertTo-ReportDate (Get-PropertyValue -InputObject $Group -Name 'whenCreated')
+        WhenChanged                     = ConvertTo-ReportDate (Get-PropertyValue -InputObject $Group -Name 'whenChanged')
+    }
+}
+
+function Export-ReportCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records,
+        [Parameter(Mandatory)][string[]]$Columns,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if ($Records.Count -gt 0) {
+        $Records | Select-Object -Property $Columns |
+            Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        $header = ($Columns | ForEach-Object { '"' + $_.Replace('"', '""') + '"' }) -join ','
+        Set-Content -LiteralPath $Path -Value $header -Encoding UTF8
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "The export command completed, but '$Path' was not created."
+    }
+    Write-Log -Level SUCCESS -Message "Exported $($Records.Count) row(s) to '$Path'."
+}
+
+function Export-Reports {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Directory)
+
+    $resolvedDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Directory)
+    if (Test-Path -LiteralPath $resolvedDirectory -PathType Leaf) {
+        throw "ExportPath must be a directory, but '$resolvedDirectory' is a file."
+    }
+    if (-not (Test-Path -LiteralPath $resolvedDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $resolvedDirectory -Force | Out-Null
+        Write-Log -Level INFO -Message "Created export directory '$resolvedDirectory'."
+    }
+
+    $groupColumns = @(
+        'ReportMode', 'GroupObjectGuid', 'Name', 'DisplayName', 'SamAccountName', 'Mail',
+        'PrimarySmtpAddress', 'MailNickname', 'GroupCategory', 'GroupScope',
+        'ScopeAssessment', 'Description', 'ManagedBy', 'DistinguishedName',
+        'DirectMemberCount', 'InspectedDirectMemberCount', 'MembershipWasTruncated',
+        'DirectGroupMemberCount', 'DirectUserMemberCount',
+        'DirectComputerMemberCount', 'DirectContactMemberCount',
+        'DirectForeignPrincipalCount', 'DirectOtherMemberCount', 'UnresolvedMemberCount',
+        'MembershipInspectionStatus', 'MembershipInspectionError', 'WhenCreated', 'WhenChanged'
+    )
+    $memberColumns = @(
+        'ReportMode', 'ParentDirectMemberCount', 'ParentInspectedMemberCount',
+        'ParentMembershipWasTruncated', 'ParentGroupObjectGuid', 'ParentGroupName', 'ParentGroupDisplayName',
+        'ParentGroupSamAccountName', 'ParentGroupMail', 'ParentGroupDistinguishedName',
+        'MemberObjectGuid', 'MemberName', 'MemberDisplayName', 'MemberSamAccountName',
+        'MemberObjectClass', 'MemberMail', 'MemberPrimarySmtpAddress',
+        'MemberUserPrincipalName', 'MemberTargetAddress', 'MemberSid',
+        'MemberDistinguishedName', 'MemberIsGroup', 'MemberGroupCategory',
+        'MemberGroupScope', 'MemberIsMailEnabledSecurityGroup',
+        'MemberIsInReportGroupSet', 'MemberWhenCreated', 'MemberWhenChanged',
+        'MembershipResolutionStatus', 'MembershipResolutionError'
+    )
+
+    $groupPath = Join-Path $resolvedDirectory "MailEnabledSecurityGroups-$script:RunStamp.csv"
+    Export-ReportCsv -Records $script:GroupRecords.ToArray() -Columns $groupColumns -Path $groupPath
+
+    if ($MemberScope -eq 'All') {
+        $memberPath = Join-Path $resolvedDirectory "MailEnabledSecurityGroupMembers-$script:RunStamp.csv"
+        Export-ReportCsv -Records $script:MemberRecords.ToArray() -Columns $memberColumns -Path $memberPath
+    }
+    if ($MemberScope -ne 'None') {
+        $nestingPath = Join-Path $resolvedDirectory "MailEnabledSecurityGroupNesting-$script:RunStamp.csv"
+        Export-ReportCsv -Records $script:NestingRecords.ToArray() -Columns $memberColumns -Path $nestingPath
+    }
+}
+
+function Show-RunSummary {
+    [CmdletBinding()]
+    param()
+
+    $duration = (Get-Date) - $script:RunStarted
+    $mailEnabledNestedGroups = @(
+        $script:NestingRecords.ToArray() |
+            Where-Object { $_.MemberIsMailEnabledSecurityGroup }
+    ).Count
+    $groupsWithErrors = @(
+        $script:GroupRecords.ToArray() |
+            Where-Object { $_.MembershipInspectionStatus -like '*WithErrors' }
+    ).Count
+
+    Write-Host ''
+    Write-Host 'Run summary' -ForegroundColor Cyan
+    Write-Host ('  Report mode:                        {0}' -f $(if ($TestMode) { "Test sample (limit $TestLimit)" } else { 'Full' })) -ForegroundColor $(if ($TestMode) { 'Yellow' } else { 'Gray' })
+    if ($TestMode) {
+        Write-Host ('  Matching groups available:          {0}' -f $script:MatchingGroupCount)
+    }
+    Write-Host ('  Mail-enabled security groups:       {0}' -f $script:GroupRecords.Count) -ForegroundColor Green
+    Write-Host ('  Direct membership rows captured:   {0}' -f $script:MemberRecords.Count)
+    Write-Host ('  Direct group-nesting relationships:{0,4}' -f $script:NestingRecords.Count) -ForegroundColor Cyan
+    Write-Host ('  Nested mail security groups:        {0}' -f $mailEnabledNestedGroups)
+    Write-Host ('  Unique member objects resolved:     {0}' -f $script:ResolvedMemberObjects)
+    Write-Host ('  Member resolution failures:         {0}' -f $script:MembershipFailures) -ForegroundColor $(if ($script:MembershipFailures -gt 0) { 'Yellow' } else { 'Gray' })
+    Write-Host ('  Groups completed with errors:       {0}' -f $groupsWithErrors) -ForegroundColor $(if ($groupsWithErrors -gt 0) { 'Yellow' } else { 'Gray' })
+    Write-Host ('  Duration:                            {0:hh\:mm\:ss}' -f $duration)
+}
+
+$fatalError = $null
+try {
+    Write-Host ''
+    Write-Host 'Active Directory - Mail-Enabled Security Group Report' -ForegroundColor Cyan
+    Write-Host "Member scope: $MemberScope (direct membership; not recursively flattened)" -ForegroundColor Yellow
+    if ($TestMode) {
+        Write-Host "TEST MODE: processing at most $TestLimit groups and $TestLimit direct members per group." -ForegroundColor Magenta
+    }
+    Write-Host ''
+
+    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+        throw 'The ActiveDirectory PowerShell module is required. Install the appropriate RSAT Active Directory tools and run the script again.'
+    }
+    Import-Module ActiveDirectory -ErrorAction Stop
+    Write-Log -Level SUCCESS -Message 'Loaded the ActiveDirectory PowerShell module.'
+
+    $connectionArguments = Get-AdConnectionArguments
+    if ([string]::IsNullOrWhiteSpace($SearchBase)) {
+        Write-Log -Level STEP -Message 'Discovering the domain default naming context.'
+        $rootDse = Get-ADRootDSE @connectionArguments
+        $SearchBase = [string]$rootDse.defaultNamingContext
+    }
+    Write-Log -Level INFO -Message "Search base: $SearchBase"
+    if (-not [string]::IsNullOrWhiteSpace($Server)) {
+        Write-Log -Level INFO -Message "Directory server: $Server"
+    }
+
+    Write-Log -Level STEP -Message 'Querying security groups with a non-empty mail attribute.'
+    $groupArguments = Get-AdConnectionArguments
+    $groupArguments.LDAPFilter = '(&(objectCategory=group)(mail=*)(groupType:1.2.840.113556.1.4.803:=2147483648))'
+    $groupArguments.SearchBase = $SearchBase
+    $groupArguments.ResultPageSize = 500
+    $groupArguments.Properties = @(
+        'description', 'displayName', 'groupCategory', 'groupScope', 'mail', 'mailNickname',
+        'managedBy', 'member', 'objectGUID', 'proxyAddresses', 'whenChanged', 'whenCreated'
+    )
+    $groups = @(Get-ADGroup @groupArguments | Sort-Object -Property Name)
+    $script:MatchingGroupCount = $groups.Count
+    Write-Log -Level SUCCESS -Message "Found $script:MatchingGroupCount mail-enabled security group(s)."
+
+    if ($TestMode -and $groups.Count -gt $TestLimit) {
+        $groups = @($groups | Select-Object -First $TestLimit)
+        Write-Log -Level WARN -Message "Test mode selected the first $($groups.Count) group(s) alphabetically from $script:MatchingGroupCount matching groups."
+    }
+    elseif ($TestMode) {
+        Write-Log -Level WARN -Message "Test mode is active; all $($groups.Count) matching group(s) fit within the limit of $TestLimit."
+    }
+
+    foreach ($group in $groups) {
+        $script:ReportGroupDns[[string]$group.DistinguishedName] = $true
+    }
+
+    $groupIndex = 0
+    foreach ($group in $groups) {
+        $groupIndex++
+        $allMemberDns = @($group.member | Sort-Object)
+        $memberDns = $allMemberDns
+        $membershipWasTruncated = $false
+        if ($TestMode -and $allMemberDns.Count -gt $TestLimit) {
+            $memberDns = @($allMemberDns | Select-Object -First $TestLimit)
+            $membershipWasTruncated = $true
+        }
+        Write-Log -Level STEP -Message "[$groupIndex/$($groups.Count)] Inspecting '$($group.Name)' <$($group.mail)>; $($allMemberDns.Count) direct member value(s) available."
+        if ($membershipWasTruncated) {
+            Write-Log -Level WARN -Message "  Test mode will inspect only $($memberDns.Count) of $($allMemberDns.Count) direct members for this group."
+        }
+
+        if ($MemberScope -eq 'None') {
+            $script:GroupRecords.Add((New-GroupInventoryRecord -Group $group -MembershipStatus 'NotRequested' -MembershipError $null -Counts $null))
+            continue
+        }
+
+        $counts = [pscustomobject]@{
+            DirectoryTotal           = $allMemberDns.Count
+            Total                    = $memberDns.Count
+            WasTruncated             = $membershipWasTruncated
+            Group                    = 0
+            User                     = 0
+            Computer                 = 0
+            Contact                  = 0
+            ForeignSecurityPrincipal = 0
+            Other                    = 0
+            Unresolved               = 0
+        }
+        $groupErrors = New-Object 'System.Collections.Generic.List[string]'
+        $memberIndex = 0
+
+        foreach ($memberDn in $memberDns) {
+            $memberIndex++
+            $resolution = Resolve-DirectMember -DistinguishedName ([string]$memberDn)
+            $relationship = New-MembershipRecord -ParentGroup $group -MemberDistinguishedName ([string]$memberDn) -Resolution $resolution
+
+            if ($resolution.Status -eq 'Failed') {
+                $counts.Unresolved++
+                $groupErrors.Add("$memberDn - $($resolution.Error)")
+                Write-Log -Level ERROR -Message "  [$memberIndex/$($memberDns.Count)] Could not resolve '$memberDn': $($resolution.Error)"
+            }
+            else {
+                $memberLabel = if ([string]::IsNullOrWhiteSpace($relationship.MemberDisplayName)) { $memberDn } else { $relationship.MemberDisplayName }
+                $memberType = if ([string]::IsNullOrWhiteSpace($relationship.MemberObjectClass)) { 'unknown' } else { $relationship.MemberObjectClass }
+                Write-Log -Level INFO -Message "  [$memberIndex/$($memberDns.Count)] $($group.Name) -> $memberLabel [$memberType]"
+
+                switch ($relationship.MemberObjectClass.ToLowerInvariant()) {
+                    'group'                    { $counts.Group++ }
+                    'user'                     { $counts.User++ }
+                    'computer'                 { $counts.Computer++ }
+                    'contact'                  { $counts.Contact++ }
+                    'foreignsecurityprincipal' { $counts.ForeignSecurityPrincipal++ }
+                    default                    { $counts.Other++ }
+                }
+            }
+
+            if ($MemberScope -eq 'All') {
+                $script:MemberRecords.Add($relationship)
+            }
+            if ($relationship.MemberIsGroup) {
+                $script:NestingRecords.Add($relationship)
+                if ($relationship.MemberIsInReportGroupSet) {
+                    Write-Log -Level WARN -Message "    Nested report group detected: '$($relationship.MemberDisplayName)'."
+                }
+            }
+        }
+
+        $inspectionStatus = if ($membershipWasTruncated -and $groupErrors.Count -gt 0) {
+            'SampledWithErrors'
+        }
+        elseif ($membershipWasTruncated) {
+            'Sampled'
+        }
+        elseif ($groupErrors.Count -gt 0) {
+            'CompletedWithErrors'
+        }
+        else {
+            'Completed'
+        }
+        $inspectionError = if ($groupErrors.Count -gt 0) { $groupErrors -join ' | ' } else { $null }
+        $script:GroupRecords.Add((New-GroupInventoryRecord -Group $group -MembershipStatus $inspectionStatus -MembershipError $inspectionError -Counts $counts))
+        Write-Log -Level SUCCESS -Message "Completed '$($group.Name)': $($counts.Group) group(s), $($counts.User) user(s), $($counts.Computer) computer(s), $($counts.Other + $counts.Contact + $counts.ForeignSecurityPrincipal) other, $($counts.Unresolved) unresolved."
+    }
+}
+catch {
+    $fatalError = $_
+    Write-Log -Level ERROR -Message "The report could not continue: $($_.Exception.Message)"
+}
+finally {
+    Show-RunSummary
+
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($ExportPath)) {
+            Export-Reports -Directory $ExportPath
+        }
+        elseif (-not $NoExportPrompt -and $null -eq $fatalError) {
+            Write-Host ''
+            $exportChoice = Read-Host 'Export the report CSV files? [Y/n]'
+            if ([string]::IsNullOrWhiteSpace($exportChoice) -or $exportChoice -match '^(?i)y(?:es)?$') {
+                $defaultDirectory = Join-Path (Get-Location).Path "MailEnabledSecurityGroups-Report-$script:RunStamp"
+                $chosenDirectory = Read-Host "Export directory [$defaultDirectory]"
+                if ([string]::IsNullOrWhiteSpace($chosenDirectory)) {
+                    $chosenDirectory = $defaultDirectory
+                }
+                Export-Reports -Directory $chosenDirectory
+            }
+            else {
+                Write-Log -Level INFO -Message 'Report data was not exported.'
+            }
+        }
+    }
+    catch {
+        Write-Log -Level ERROR -Message "Could not export report CSV files: $($_.Exception.Message)"
+        if ($null -eq $fatalError) {
+            $fatalError = $_
+        }
+    }
+}
+
+if ($null -ne $fatalError) {
+    throw $fatalError
+}
