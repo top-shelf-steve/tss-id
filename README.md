@@ -155,6 +155,20 @@ In this mode, filenames begin with `MailEnabledGroups-`, and the `GroupCategory`
 `GroupScope` columns distinguish security/distribution and universal/global/domain-local
 groups. The `SourceGroupCriteria` column also records the criteria used for the run.
 
+Target one group by exact name, display name, `sAMAccountName`, distinguished name, SID,
+or object GUID, and preview its first 15 direct members:
+
+```powershell
+.\Get-MailEnabledSecurityGroups.ps1 `
+    -GroupIdentity 'Finance Distribution List' `
+    -IncludeDistributionGroups `
+    -TestMode `
+    -ExportPath C:\Reports\FinanceTest
+```
+
+Omit `-TestMode` to capture all direct members of the targeted group. Distribution groups
+require `-IncludeDistributionGroups`; the script reports a clear error if it is omitted.
+
 Capture only group nesting for a smaller diagram-focused dataset:
 
 ```powershell

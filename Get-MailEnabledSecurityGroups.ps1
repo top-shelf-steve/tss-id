@@ -24,6 +24,11 @@ GroupsOnly captures only direct members that are groups. None produces only grou
 Includes distribution groups as well as security groups. When omitted, the report contains
 only security-enabled groups with a mail value. GroupCategory and GroupScope are exported.
 
+.PARAMETER GroupIdentity
+Targets one group by distinguished name, object GUID, SID, sAMAccountName, exact name, or
+exact display name. A targeted group must have a mail value and match the selected source
+criteria. Use -IncludeDistributionGroups when targeting a distribution group.
+
 .PARAMETER SearchBase
 Distinguished name at which to begin the group search. The domain default naming context is
 used when this is omitted.
@@ -65,6 +70,11 @@ Captures only group-to-group relationships, which is the smallest useful diagram
 Captures security and distribution groups that have a populated AD mail attribute.
 
 .EXAMPLE
+.\Get-MailEnabledSecurityGroups.ps1 -GroupIdentity 'Finance Distribution List' -IncludeDistributionGroups -TestMode -ExportPath C:\Reports\FinanceTest
+
+Targets one distribution group and samples its first 15 direct members.
+
+.EXAMPLE
 .\Get-MailEnabledSecurityGroups.ps1 -TestMode -MemberScope GroupsOnly -ExportPath C:\Reports\Test
 
 Produces a small sample using at most 15 groups and 15 direct members from each group.
@@ -89,6 +99,9 @@ param(
     [string]$MemberScope = 'All',
 
     [switch]$IncludeDistributionGroups,
+
+    [ValidateNotNullOrEmpty()]
+    [string]$GroupIdentity,
 
     [ValidateNotNullOrEmpty()]
     [string]$SearchBase,
@@ -125,6 +138,10 @@ $script:MatchingGroupCount = 0
 $script:SourceGroupCriteria = if ($IncludeDistributionGroups) { 'AllMailEnabledGroups' } else { 'MailEnabledSecurityGroups' }
 $script:SourceGroupLabel = if ($IncludeDistributionGroups) { 'mail-enabled group(s)' } else { 'mail-enabled security group(s)' }
 $script:ExportFilePrefix = if ($IncludeDistributionGroups) { 'MailEnabledGroup' } else { 'MailEnabledSecurityGroup' }
+$script:GroupProperties = @(
+    'description', 'displayName', 'groupCategory', 'groupScope', 'mail', 'mailNickname',
+    'managedBy', 'member', 'objectGUID', 'proxyAddresses', 'whenChanged', 'whenCreated'
+)
 
 function Write-Log {
     [CmdletBinding()]
@@ -268,6 +285,71 @@ function Get-AdConnectionArguments {
         $arguments.Credential = $Credential
     }
     return $arguments
+}
+
+function ConvertTo-LdapFilterValue {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Value)
+
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($character in $Value.ToCharArray()) {
+        switch ([int][char]$character) {
+            0  { [void]$builder.Append('\00') }
+            40 { [void]$builder.Append('\28') }
+            41 { [void]$builder.Append('\29') }
+            42 { [void]$builder.Append('\2a') }
+            92 { [void]$builder.Append('\5c') }
+            default { [void]$builder.Append($character) }
+        }
+    }
+    return $builder.ToString()
+}
+
+function Resolve-TargetGroup {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Identity)
+
+    $trimmedIdentity = $Identity.Trim()
+    $group = $null
+
+    try {
+        $identityArguments = Get-AdConnectionArguments
+        $identityArguments.Identity = $trimmedIdentity
+        $identityArguments.Properties = $script:GroupProperties
+        $group = Get-ADGroup @identityArguments
+        Write-Log -Level DEBUG -Message "Resolved '$trimmedIdentity' using an AD group identity."
+    }
+    catch {
+        Write-Log -Level DEBUG -Message "'$trimmedIdentity' was not resolved as a DN, GUID, SID, or sAMAccountName; trying exact name and display name."
+    }
+
+    if ($null -eq $group) {
+        $escapedIdentity = ConvertTo-LdapFilterValue -Value $trimmedIdentity
+        $searchArguments = Get-AdConnectionArguments
+        $searchArguments.LDAPFilter = "(&(objectCategory=group)(|(name=$escapedIdentity)(displayName=$escapedIdentity)))"
+        $searchArguments.SearchBase = $SearchBase
+        $searchArguments.ResultPageSize = 100
+        $searchArguments.Properties = $script:GroupProperties
+        $matches = @(Get-ADGroup @searchArguments)
+
+        if ($matches.Count -eq 0) {
+            throw "No group matching '$trimmedIdentity' was found. Try its sAMAccountName, distinguished name, or object GUID."
+        }
+        if ($matches.Count -gt 1) {
+            $distinguishedNames = ($matches | ForEach-Object { $_.DistinguishedName }) -join '; '
+            throw "More than one group has the exact name or display name '$trimmedIdentity'. Re-run with one of these distinguished names: $distinguishedNames"
+        }
+        $group = $matches[0]
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$group.mail)) {
+        throw "Group '$($group.Name)' was found, but its AD mail attribute is empty, so it is not eligible for this report."
+    }
+    if (-not $IncludeDistributionGroups -and [string]$group.GroupCategory -ine 'Security') {
+        throw "Group '$($group.Name)' is a $($group.GroupCategory) group. Re-run with -IncludeDistributionGroups to report it."
+    }
+
+    return $group
 }
 
 function Resolve-DirectMember {
@@ -553,25 +635,34 @@ try {
         Write-Log -Level INFO -Message "Directory server: $Server"
     }
 
-    Write-Log -Level STEP -Message "Querying $script:SourceGroupLabel with a non-empty mail attribute."
-    $groupArguments = Get-AdConnectionArguments
-    if ($IncludeDistributionGroups) {
-        $groupArguments.LDAPFilter = '(&(objectCategory=group)(mail=*))'
+    if (-not [string]::IsNullOrWhiteSpace($GroupIdentity)) {
+        Write-Log -Level STEP -Message "Resolving targeted group '$GroupIdentity'."
+        $targetGroup = Resolve-TargetGroup -Identity $GroupIdentity
+        $groups = @($targetGroup)
+        $script:MatchingGroupCount = 1
+        Write-Log -Level SUCCESS -Message "Targeted '$($targetGroup.Name)' <$($targetGroup.mail)> [$($targetGroup.GroupCategory), $($targetGroup.GroupScope)]."
     }
     else {
-        $groupArguments.LDAPFilter = '(&(objectCategory=group)(mail=*)(groupType:1.2.840.113556.1.4.803:=2147483648))'
+        Write-Log -Level STEP -Message "Querying $script:SourceGroupLabel with a non-empty mail attribute."
+        $groupArguments = Get-AdConnectionArguments
+        if ($IncludeDistributionGroups) {
+            $groupArguments.LDAPFilter = '(&(objectCategory=group)(mail=*))'
+        }
+        else {
+            $groupArguments.LDAPFilter = '(&(objectCategory=group)(mail=*)(groupType:1.2.840.113556.1.4.803:=2147483648))'
+        }
+        $groupArguments.SearchBase = $SearchBase
+        $groupArguments.ResultPageSize = 500
+        $groupArguments.Properties = $script:GroupProperties
+        $groups = @(Get-ADGroup @groupArguments | Sort-Object -Property Name)
+        $script:MatchingGroupCount = $groups.Count
+        Write-Log -Level SUCCESS -Message "Found $script:MatchingGroupCount $script:SourceGroupLabel."
     }
-    $groupArguments.SearchBase = $SearchBase
-    $groupArguments.ResultPageSize = 500
-    $groupArguments.Properties = @(
-        'description', 'displayName', 'groupCategory', 'groupScope', 'mail', 'mailNickname',
-        'managedBy', 'member', 'objectGUID', 'proxyAddresses', 'whenChanged', 'whenCreated'
-    )
-    $groups = @(Get-ADGroup @groupArguments | Sort-Object -Property Name)
-    $script:MatchingGroupCount = $groups.Count
-    Write-Log -Level SUCCESS -Message "Found $script:MatchingGroupCount $script:SourceGroupLabel."
 
-    if ($TestMode -and $groups.Count -gt $TestLimit) {
+    if ($TestMode -and -not [string]::IsNullOrWhiteSpace($GroupIdentity)) {
+        Write-Log -Level WARN -Message "Test mode will limit direct-member inspection for the targeted group to $TestLimit member(s)."
+    }
+    elseif ($TestMode -and $groups.Count -gt $TestLimit) {
         $groups = @($groups | Select-Object -First $TestLimit)
         Write-Log -Level WARN -Message "Test mode selected the first $($groups.Count) group(s) alphabetically from $script:MatchingGroupCount matching groups."
     }
