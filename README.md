@@ -115,7 +115,9 @@ Graph changes, while still allowing the requested results report to be saved.
 # Mail-Enabled Security Group Report
 
 `Get-MailEnabledSecurityGroups.ps1` inventories on-premises Active Directory
-mail-enabled security groups and captures their direct membership relationships.
+mail-enabled groups and captures their direct membership relationships. It reports
+mail-enabled security groups by default; `-IncludeDistributionGroups` includes both
+security and distribution groups.
 
 The default `All` member scope produces three relational CSV datasets:
 
@@ -140,6 +142,18 @@ Capture all direct membership and export all three datasets:
 ```powershell
 .\Get-MailEnabledSecurityGroups.ps1 -ExportPath C:\Reports
 ```
+
+Include every AD group with a populated `mail` attribute:
+
+```powershell
+.\Get-MailEnabledSecurityGroups.ps1 `
+    -IncludeDistributionGroups `
+    -ExportPath C:\Reports\AllMailGroups
+```
+
+In this mode, filenames begin with `MailEnabledGroups-`, and the `GroupCategory` and
+`GroupScope` columns distinguish security/distribution and universal/global/domain-local
+groups. The `SourceGroupCriteria` column also records the criteria used for the run.
 
 Capture only group nesting for a smaller diagram-focused dataset:
 

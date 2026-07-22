@@ -1,10 +1,11 @@
 <#
 .SYNOPSIS
-Reports mail-enabled security groups and their direct Active Directory membership.
+Reports mail-enabled Active Directory groups and their direct membership.
 
 .DESCRIPTION
-Queries on-premises Active Directory for security groups that have a mail attribute. The
-script exports relational CSV files that can be used for review, analysis, or diagramming:
+Queries on-premises Active Directory for security groups that have a mail attribute. Use
+-IncludeDistributionGroups to include every AD group with a mail value. The script exports
+relational CSV files that can be used for review, analysis, or diagramming:
 
   * Groups: one row per mail-enabled security group.
   * Members: one row per direct group-to-member relationship (MemberScope All only).
@@ -18,6 +19,10 @@ excluded.
 .PARAMETER MemberScope
 All (default) captures every direct member and also produces the group-nesting subset.
 GroupsOnly captures only direct members that are groups. None produces only group inventory.
+
+.PARAMETER IncludeDistributionGroups
+Includes distribution groups as well as security groups. When omitted, the report contains
+only security-enabled groups with a mail value. GroupCategory and GroupScope are exported.
 
 .PARAMETER SearchBase
 Distinguished name at which to begin the group search. The domain default naming context is
@@ -55,6 +60,11 @@ Captures every direct member and writes group, member, and group-nesting CSV fil
 Captures only group-to-group relationships, which is the smallest useful diagram dataset.
 
 .EXAMPLE
+.\Get-MailEnabledSecurityGroups.ps1 -IncludeDistributionGroups -ExportPath C:\Reports\AllMailGroups
+
+Captures security and distribution groups that have a populated AD mail attribute.
+
+.EXAMPLE
 .\Get-MailEnabledSecurityGroups.ps1 -TestMode -MemberScope GroupsOnly -ExportPath C:\Reports\Test
 
 Produces a small sample using at most 15 groups and 15 direct members from each group.
@@ -66,9 +76,9 @@ Creates an inventory without resolving member objects.
 
 .NOTES
 Requires Windows PowerShell 5.1 or PowerShell 7+ and the ActiveDirectory module (RSAT).
-"Mail-enabled" is determined from on-premises AD as GroupCategory=Security plus a non-empty
-mail attribute. This is an AD attribute report; it does not validate the objects against an
-Exchange recipient directory.
+By default, "mail-enabled" is determined from on-premises AD as GroupCategory=Security plus
+a non-empty mail attribute. -IncludeDistributionGroups removes the security-category
+restriction. This is an AD attribute report; it does not validate objects against Exchange.
 #>
 
 #Requires -Version 5.1
@@ -77,6 +87,8 @@ Exchange recipient directory.
 param(
     [ValidateSet('All', 'GroupsOnly', 'None')]
     [string]$MemberScope = 'All',
+
+    [switch]$IncludeDistributionGroups,
 
     [ValidateNotNullOrEmpty()]
     [string]$SearchBase,
@@ -110,6 +122,9 @@ $script:ReportGroupDns = @{}
 $script:MembershipFailures = 0
 $script:ResolvedMemberObjects = 0
 $script:MatchingGroupCount = 0
+$script:SourceGroupCriteria = if ($IncludeDistributionGroups) { 'AllMailEnabledGroups' } else { 'MailEnabledSecurityGroups' }
+$script:SourceGroupLabel = if ($IncludeDistributionGroups) { 'mail-enabled group(s)' } else { 'mail-enabled security group(s)' }
+$script:ExportFilePrefix = if ($IncludeDistributionGroups) { 'MailEnabledGroup' } else { 'MailEnabledSecurityGroup' }
 
 function Write-Log {
     [CmdletBinding()]
@@ -308,6 +323,7 @@ function New-MembershipRecord {
     $memberGroupType = Get-PropertyValue -InputObject $member -Name 'groupType'
     $memberIsGroup = $memberClass -ieq 'group'
     $memberIsSecurityGroup = $memberIsGroup -and (Test-SecurityGroupType -GroupType $memberGroupType)
+    $memberIsMailEnabledGroup = $memberIsGroup -and -not [string]::IsNullOrWhiteSpace($memberMail)
     $memberIsMailEnabledSecurityGroup = $memberIsSecurityGroup -and -not [string]::IsNullOrWhiteSpace($memberMail)
     $memberIsReportGroup = $script:ReportGroupDns.ContainsKey($MemberDistinguishedName)
     $memberName = [string](Get-PropertyValue -InputObject $member -Name 'Name')
@@ -323,6 +339,7 @@ function New-MembershipRecord {
 
     [pscustomobject][ordered]@{
         ReportMode                           = if ($TestMode) { 'TestSample' } else { 'Full' }
+        SourceGroupCriteria                  = $script:SourceGroupCriteria
         ParentDirectMemberCount              = $parentDirectMemberCount
         ParentInspectedMemberCount           = $parentInspectedMemberCount
         ParentMembershipWasTruncated         = $TestMode -and $parentDirectMemberCount -gt $TestLimit
@@ -346,6 +363,7 @@ function New-MembershipRecord {
         MemberIsGroup                        = $memberIsGroup
         MemberGroupCategory                  = if ($memberIsGroup) { if ($memberIsSecurityGroup) { 'Security' } else { 'Distribution' } } else { $null }
         MemberGroupScope                     = if ($memberIsGroup) { Get-GroupScopeFromType -GroupType $memberGroupType } else { $null }
+        MemberIsMailEnabledGroup             = $memberIsMailEnabledGroup
         MemberIsMailEnabledSecurityGroup     = $memberIsMailEnabledSecurityGroup
         MemberIsInReportGroupSet             = $memberIsReportGroup
         MemberWhenCreated                    = ConvertTo-ReportDate (Get-PropertyValue -InputObject $member -Name 'whenCreated')
@@ -369,6 +387,7 @@ function New-GroupInventoryRecord {
 
     [pscustomobject][ordered]@{
         ReportMode                      = if ($TestMode) { 'TestSample' } else { 'Full' }
+        SourceGroupCriteria             = $script:SourceGroupCriteria
         GroupObjectGuid                 = ConvertTo-ReportGuid (Get-PropertyValue -InputObject $Group -Name 'ObjectGUID')
         Name                            = [string](Get-PropertyValue -InputObject $Group -Name 'Name')
         DisplayName                     = [string](Get-PropertyValue -InputObject $Group -Name 'DisplayName')
@@ -436,7 +455,7 @@ function Export-Reports {
     }
 
     $groupColumns = @(
-        'ReportMode', 'GroupObjectGuid', 'Name', 'DisplayName', 'SamAccountName', 'Mail',
+        'ReportMode', 'SourceGroupCriteria', 'GroupObjectGuid', 'Name', 'DisplayName', 'SamAccountName', 'Mail',
         'PrimarySmtpAddress', 'MailNickname', 'GroupCategory', 'GroupScope',
         'ScopeAssessment', 'Description', 'ManagedBy', 'DistinguishedName',
         'DirectMemberCount', 'InspectedDirectMemberCount', 'MembershipWasTruncated',
@@ -446,27 +465,27 @@ function Export-Reports {
         'MembershipInspectionStatus', 'MembershipInspectionError', 'WhenCreated', 'WhenChanged'
     )
     $memberColumns = @(
-        'ReportMode', 'ParentDirectMemberCount', 'ParentInspectedMemberCount',
+        'ReportMode', 'SourceGroupCriteria', 'ParentDirectMemberCount', 'ParentInspectedMemberCount',
         'ParentMembershipWasTruncated', 'ParentGroupObjectGuid', 'ParentGroupName', 'ParentGroupDisplayName',
         'ParentGroupSamAccountName', 'ParentGroupMail', 'ParentGroupDistinguishedName',
         'MemberObjectGuid', 'MemberName', 'MemberDisplayName', 'MemberSamAccountName',
         'MemberObjectClass', 'MemberMail', 'MemberPrimarySmtpAddress',
         'MemberUserPrincipalName', 'MemberTargetAddress', 'MemberSid',
         'MemberDistinguishedName', 'MemberIsGroup', 'MemberGroupCategory',
-        'MemberGroupScope', 'MemberIsMailEnabledSecurityGroup',
+        'MemberGroupScope', 'MemberIsMailEnabledGroup', 'MemberIsMailEnabledSecurityGroup',
         'MemberIsInReportGroupSet', 'MemberWhenCreated', 'MemberWhenChanged',
         'MembershipResolutionStatus', 'MembershipResolutionError'
     )
 
-    $groupPath = Join-Path $resolvedDirectory "MailEnabledSecurityGroups-$script:RunStamp.csv"
+    $groupPath = Join-Path $resolvedDirectory "$($script:ExportFilePrefix)s-$script:RunStamp.csv"
     Export-ReportCsv -Records $script:GroupRecords.ToArray() -Columns $groupColumns -Path $groupPath
 
     if ($MemberScope -eq 'All') {
-        $memberPath = Join-Path $resolvedDirectory "MailEnabledSecurityGroupMembers-$script:RunStamp.csv"
+        $memberPath = Join-Path $resolvedDirectory "$($script:ExportFilePrefix)Members-$script:RunStamp.csv"
         Export-ReportCsv -Records $script:MemberRecords.ToArray() -Columns $memberColumns -Path $memberPath
     }
     if ($MemberScope -ne 'None') {
-        $nestingPath = Join-Path $resolvedDirectory "MailEnabledSecurityGroupNesting-$script:RunStamp.csv"
+        $nestingPath = Join-Path $resolvedDirectory "$($script:ExportFilePrefix)Nesting-$script:RunStamp.csv"
         Export-ReportCsv -Records $script:NestingRecords.ToArray() -Columns $memberColumns -Path $nestingPath
     }
 }
@@ -477,6 +496,10 @@ function Show-RunSummary {
 
     $duration = (Get-Date) - $script:RunStarted
     $mailEnabledNestedGroups = @(
+        $script:NestingRecords.ToArray() |
+            Where-Object { $_.MemberIsMailEnabledGroup }
+    ).Count
+    $mailEnabledNestedSecurityGroups = @(
         $script:NestingRecords.ToArray() |
             Where-Object { $_.MemberIsMailEnabledSecurityGroup }
     ).Count
@@ -491,10 +514,11 @@ function Show-RunSummary {
     if ($TestMode) {
         Write-Host ('  Matching groups available:          {0}' -f $script:MatchingGroupCount)
     }
-    Write-Host ('  Mail-enabled security groups:       {0}' -f $script:GroupRecords.Count) -ForegroundColor Green
+    Write-Host ('  Source groups captured:             {0}' -f $script:GroupRecords.Count) -ForegroundColor Green
     Write-Host ('  Direct membership rows captured:   {0}' -f $script:MemberRecords.Count)
     Write-Host ('  Direct group-nesting relationships:{0,4}' -f $script:NestingRecords.Count) -ForegroundColor Cyan
-    Write-Host ('  Nested mail security groups:        {0}' -f $mailEnabledNestedGroups)
+    Write-Host ('  Nested mail-enabled groups:         {0}' -f $mailEnabledNestedGroups)
+    Write-Host ('  Nested mail security groups:        {0}' -f $mailEnabledNestedSecurityGroups)
     Write-Host ('  Unique member objects resolved:     {0}' -f $script:ResolvedMemberObjects)
     Write-Host ('  Member resolution failures:         {0}' -f $script:MembershipFailures) -ForegroundColor $(if ($script:MembershipFailures -gt 0) { 'Yellow' } else { 'Gray' })
     Write-Host ('  Groups completed with errors:       {0}' -f $groupsWithErrors) -ForegroundColor $(if ($groupsWithErrors -gt 0) { 'Yellow' } else { 'Gray' })
@@ -504,7 +528,8 @@ function Show-RunSummary {
 $fatalError = $null
 try {
     Write-Host ''
-    Write-Host 'Active Directory - Mail-Enabled Security Group Report' -ForegroundColor Cyan
+    Write-Host 'Active Directory - Mail-Enabled Group Report' -ForegroundColor Cyan
+    Write-Host "Source criteria: $script:SourceGroupCriteria" -ForegroundColor Yellow
     Write-Host "Member scope: $MemberScope (direct membership; not recursively flattened)" -ForegroundColor Yellow
     if ($TestMode) {
         Write-Host "TEST MODE: processing at most $TestLimit groups and $TestLimit direct members per group." -ForegroundColor Magenta
@@ -528,9 +553,14 @@ try {
         Write-Log -Level INFO -Message "Directory server: $Server"
     }
 
-    Write-Log -Level STEP -Message 'Querying security groups with a non-empty mail attribute.'
+    Write-Log -Level STEP -Message "Querying $script:SourceGroupLabel with a non-empty mail attribute."
     $groupArguments = Get-AdConnectionArguments
-    $groupArguments.LDAPFilter = '(&(objectCategory=group)(mail=*)(groupType:1.2.840.113556.1.4.803:=2147483648))'
+    if ($IncludeDistributionGroups) {
+        $groupArguments.LDAPFilter = '(&(objectCategory=group)(mail=*))'
+    }
+    else {
+        $groupArguments.LDAPFilter = '(&(objectCategory=group)(mail=*)(groupType:1.2.840.113556.1.4.803:=2147483648))'
+    }
     $groupArguments.SearchBase = $SearchBase
     $groupArguments.ResultPageSize = 500
     $groupArguments.Properties = @(
@@ -539,7 +569,7 @@ try {
     )
     $groups = @(Get-ADGroup @groupArguments | Sort-Object -Property Name)
     $script:MatchingGroupCount = $groups.Count
-    Write-Log -Level SUCCESS -Message "Found $script:MatchingGroupCount mail-enabled security group(s)."
+    Write-Log -Level SUCCESS -Message "Found $script:MatchingGroupCount $script:SourceGroupLabel."
 
     if ($TestMode -and $groups.Count -gt $TestLimit) {
         $groups = @($groups | Select-Object -First $TestLimit)
@@ -656,7 +686,7 @@ finally {
             Write-Host ''
             $exportChoice = Read-Host 'Export the report CSV files? [Y/n]'
             if ([string]::IsNullOrWhiteSpace($exportChoice) -or $exportChoice -match '^(?i)y(?:es)?$') {
-                $defaultDirectory = Join-Path (Get-Location).Path "MailEnabledSecurityGroups-Report-$script:RunStamp"
+                $defaultDirectory = Join-Path (Get-Location).Path "$($script:ExportFilePrefix)s-Report-$script:RunStamp"
                 $chosenDirectory = Read-Host "Export directory [$defaultDirectory]"
                 if ([string]::IsNullOrWhiteSpace($chosenDirectory)) {
                     $chosenDirectory = $defaultDirectory
