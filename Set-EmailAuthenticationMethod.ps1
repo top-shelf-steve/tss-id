@@ -34,6 +34,11 @@ skipped unless their corresponding include switches are supplied.
 .PARAMETER EmailSource
 MailThenUserPrincipalName (default), Mail, or UserPrincipalName.
 
+.PARAMETER SkipExistingEmailMethod
+Skips a user when any email authentication method is already registered, even when its
+address differs from the desired address. Combine with -AllUsers -EmailSource Mail to
+populate only missing methods from each user's directory mail property.
+
 .PARAMETER ExportPath
 Exports results without prompting. Use a .json extension for JSON; all other extensions
 produce CSV. If this is a directory, a timestamped CSV filename is created in it.
@@ -50,6 +55,9 @@ Result exports are written even when -WhatIf is active; -WhatIf suppresses Graph
 
 .EXAMPLE
 .\Set-EmailAuthenticationMethod.ps1 -CsvPath .\users.csv
+
+.EXAMPLE
+.\Set-EmailAuthenticationMethod.ps1 -AllUsers -SkipExistingEmailMethod -EmailSource Mail -Force
 
 .NOTES
 Email authentication methods are available for SSPR only; they are not an MFA sign-in
@@ -84,6 +92,9 @@ param(
 
     [ValidateSet('MailThenUserPrincipalName', 'Mail', 'UserPrincipalName')]
     [string]$EmailSource = 'MailThenUserPrincipalName',
+
+    [Alias('OnlyIfMissing')]
+    [switch]$SkipExistingEmailMethod,
 
     [switch]$IncludeGuests,
 
@@ -436,10 +447,11 @@ function Show-InteractiveMenu {
     Write-Host '  2. Several users'
     Write-Host '  3. All users in a group (including nested members)'
     Write-Host '  4. Users from a CSV file'
-    Write-Host '  5. All tenant users'
+    Write-Host '  5. All tenant users (create or update)'
+    Write-Host '  6. All tenant users missing an email method (use directory mail)'
     Write-Host ''
 
-    $selection = Read-Host 'Choose 1-5'
+    $selection = Read-Host 'Choose 1-6'
     switch ($selection) {
         '1' {
             $script:UserId = Read-Host 'User object ID or user principal name'
@@ -462,8 +474,14 @@ function Show-InteractiveMenu {
             $script:AllUsers = $true
             return 'All'
         }
+        '6' {
+            $script:AllUsers = $true
+            $script:EmailSource = 'Mail'
+            $script:SkipExistingEmailMethod = $true
+            return 'All'
+        }
         default {
-            throw "'$selection' is not a valid selection. Run the script again and choose a number from 1 through 5."
+            throw "'$selection' is not a valid selection. Run the script again and choose a number from 1 through 6."
         }
     }
 }
@@ -721,20 +739,41 @@ try {
             continue
         }
 
-        $desiredEmail = Get-DesiredEmailAddress -User $user -Override $target.EmailOverride
-        if (-not (Test-EmailAddress -Address $desiredEmail)) {
-            $message = "No valid desired email address was found using EmailSource '$EmailSource'."
-            Write-Log -Level ERROR -Message "$label - $message"
-            Add-RunResult -Source $target.Source -InputIdentity $target.InputIdentity -User $user -RequestedEmail $desiredEmail -Action 'Validate' -Status 'Failed' -Message $message
-            continue
+        $desiredEmail = $null
+        if (-not $SkipExistingEmailMethod) {
+            $desiredEmail = Get-DesiredEmailAddress -User $user -Override $target.EmailOverride
+            if (-not (Test-EmailAddress -Address $desiredEmail)) {
+                $message = "No valid desired email address was found using EmailSource '$EmailSource'."
+                Write-Log -Level ERROR -Message "$label - $message"
+                Add-RunResult -Source $target.Source -InputIdentity $target.InputIdentity -User $user -RequestedEmail $desiredEmail -Action 'Validate' -Status 'Failed' -Message $message
+                continue
+            }
         }
 
         try {
-            Write-Log -Level INFO -Message "$label - desired SSPR email is '$desiredEmail'."
             $methodUri = "$script:GraphBaseUri/users/$($user.id)/authentication/emailMethods"
             $methods = @(Get-GraphCollection -Uri $methodUri)
             $existing = if ($methods.Count -gt 0) { $methods[0] } else { $null }
             $previousEmail = if ($null -ne $existing) { [string]$existing.emailAddress } else { $null }
+
+            if ($SkipExistingEmailMethod -and $null -ne $existing) {
+                $message = 'An email authentication method is already registered; it was left unchanged.'
+                Write-Log -Level INFO -Message "$label - $message"
+                Add-RunResult -Source $target.Source -InputIdentity $target.InputIdentity -User $user -PreviousEmail $previousEmail -Action 'None' -Status 'Skipped' -Message $message
+                continue
+            }
+
+            if ($SkipExistingEmailMethod) {
+                $desiredEmail = Get-DesiredEmailAddress -User $user -Override $target.EmailOverride
+                if (-not (Test-EmailAddress -Address $desiredEmail)) {
+                    $message = "No valid desired email address was found using EmailSource '$EmailSource'."
+                    Write-Log -Level ERROR -Message "$label - $message"
+                    Add-RunResult -Source $target.Source -InputIdentity $target.InputIdentity -User $user -RequestedEmail $desiredEmail -Action 'Validate' -Status 'Failed' -Message $message
+                    continue
+                }
+            }
+
+            Write-Log -Level INFO -Message "$label - desired SSPR email is '$desiredEmail'."
 
             if ($null -ne $existing -and $previousEmail -ieq $desiredEmail) {
                 $message = 'The registered email authentication method is already correct.'

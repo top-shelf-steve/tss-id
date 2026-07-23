@@ -330,16 +330,16 @@ function Resolve-TargetGroup {
         $searchArguments.SearchBase = $SearchBase
         $searchArguments.ResultPageSize = 100
         $searchArguments.Properties = $script:GroupProperties
-        $matches = @(Get-ADGroup @searchArguments)
+        $matchingGroups = @(Get-ADGroup @searchArguments)
 
-        if ($matches.Count -eq 0) {
+        if ($matchingGroups.Count -eq 0) {
             throw "No group matching '$trimmedIdentity' was found. Try its sAMAccountName, distinguished name, or object GUID."
         }
-        if ($matches.Count -gt 1) {
-            $distinguishedNames = ($matches | ForEach-Object { $_.DistinguishedName }) -join '; '
+        if ($matchingGroups.Count -gt 1) {
+            $distinguishedNames = ($matchingGroups | ForEach-Object { $_.DistinguishedName }) -join '; '
             throw "More than one group has the exact name or display name '$trimmedIdentity'. Re-run with one of these distinguished names: $distinguishedNames"
         }
-        $group = $matches[0]
+        $group = $matchingGroups[0]
     }
 
     if ([string]::IsNullOrWhiteSpace([string]$group.mail)) {

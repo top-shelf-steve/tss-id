@@ -14,6 +14,7 @@ as their Microsoft Graph `emailAuthenticationMethod`.
 - Uses the directory `mail` value, with configurable UPN fallback
 - Optional per-row email override for CSV imports
 - Idempotent create/update/unchanged behavior
+- Optional create-only mode that skips users with an existing email authentication method
 - Skips guests and disabled accounts by default
 - Detailed, timestamped terminal logging and retry handling
 - Bulk confirmation, `-WhatIf`, and standard PowerShell `-Confirm` support
@@ -72,6 +73,21 @@ Target all enabled member users in the tenant:
 ```powershell
 .\Set-EmailAuthenticationMethod.ps1 -AllUsers -Force
 ```
+
+Populate only missing email authentication methods for all enabled member users. This
+checks each user first, leaves every existing method unchanged, and uses only the user's
+directory `mail` property for new methods:
+
+```powershell
+.\Set-EmailAuthenticationMethod.ps1 `
+    -AllUsers `
+    -SkipExistingEmailMethod `
+    -EmailSource Mail `
+    -Force
+```
+
+The same workflow is available as option 6 in the interactive menu. `OnlyIfMissing` is
+also accepted as a shorter alias for `SkipExistingEmailMethod`.
 
 By default, a missing `mail` value falls back to `userPrincipalName`. To require the
 directory `mail` property instead:
