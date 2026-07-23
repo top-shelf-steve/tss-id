@@ -1,3 +1,128 @@
+# Set User Group Access
+
+`Set-UserAccessPackage.ps1` is an ad hoc Microsoft Entra group-membership utility for
+granting access that is already connected to groups, such as SSO or SCIM provisioning. It
+can add one user to explicitly selected groups or compare the user with a reference user and
+process only the direct assigned-group membership delta.
+
+> [!IMPORTANT]
+> The script changes group membership only. It does not assign groups to enterprise
+> applications. The selected groups must already be configured for the relevant SSO or SCIM
+> applications.
+
+## Features
+
+- Interactive menu when run without parameters
+- Target and reference users accepted by object ID or user principal name
+- Explicit groups accepted by object ID or exact display name
+- Editable named group sets such as `HR` and `IT`, selectable with `-ManualGroupSet`
+- Direct membership comparison, without flattening inherited/nested memberships
+- Dynamic groups excluded from the assigned-group delta
+- Per-group review with `-Compare`, or automatic delta processing with `-AddAll`
+- Automatic safety skips for role-assignable, synchronized, mail-enabled read-only, and
+  unsupported group types
+- Duplicate and already-member detection
+- Retry handling, `-WhatIf`, standard PowerShell `-Confirm`, and CSV/JSON result export
+
+## Requirements
+
+- Windows PowerShell 5.1 or PowerShell 7+
+- `Microsoft.Graph.Authentication` module
+- Delegated Microsoft Graph scopes:
+  - `User.Read.All`
+  - `GroupMember.ReadWrite.All`
+- A signed-in account that can update the selected groups, such as a group owner or a user
+  with a supported Microsoft Entra role
+
+Install the required module if needed:
+
+```powershell
+Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+```
+
+## Usage
+
+Run interactively:
+
+```powershell
+.\Set-UserAccessPackage.ps1
+```
+
+Add a user to explicitly selected groups:
+
+```powershell
+.\Set-UserAccessPackage.ps1 `
+    -UserId new.user@contoso.com `
+    -GroupId 'Sales SSO','CRM SCIM'
+```
+
+Configure reusable group sets in the `MANUAL GROUP SETS` section near the top of
+`Set-UserAccessPackage.ps1`. Object IDs are recommended because they remain stable when a
+group is renamed:
+
+```powershell
+$script:ManualGroupSets = [ordered]@{
+    HR = @(
+        '11111111-1111-1111-1111-111111111111'
+        'HR Application Users'
+    )
+    IT = @(
+        '22222222-2222-2222-2222-222222222222'
+        'IT Admin Tools SSO'
+    )
+}
+```
+
+Apply one group set:
+
+```powershell
+.\Set-UserAccessPackage.ps1 `
+    -UserId new.user@contoso.com `
+    -ManualGroupSet HR
+```
+
+Multiple sets can be combined; duplicate group identities and resolved group IDs are
+deduplicated:
+
+```powershell
+.\Set-UserAccessPackage.ps1 `
+    -UserId new.user@contoso.com `
+    -ManualGroupSet HR,IT `
+    -WhatIf
+```
+
+Compare a user with a reference user and approve each eligible delta group:
+
+```powershell
+.\Set-UserAccessPackage.ps1 `
+    -UserId new.user@contoso.com `
+    -CompareUserId template.user@contoso.com `
+    -Compare
+```
+
+Preview adding the complete eligible delta without making changes:
+
+```powershell
+.\Set-UserAccessPackage.ps1 `
+    -UserId new.user@contoso.com `
+    -CompareUserId template.user@contoso.com `
+    -AddAll `
+    -WhatIf `
+    -NoExportPrompt
+```
+
+Remove `-WhatIf` to perform the additions. `-AddAll` suppresses the script's custom
+per-group review, while standard `-Confirm` remains available if PowerShell confirmation is
+desired. Comparison uses direct membership for both users: a reference user's inherited
+membership is not copied, and a target user's inherited membership does not count as an
+existing direct assignment.
+
+Use `-ExportPath C:\Reports` to automatically create a timestamped CSV, or specify a `.json`
+filename for JSON. Every excluded, declined, successful, and failed group is represented in
+the result data.
+
+---
+
 # Set Email Authentication Method
 
 `Set-EmailAuthenticationMethod.ps1` registers a Microsoft Entra user's work email address
