@@ -16,6 +16,7 @@ process only the direct assigned-group membership delta.
 - Target and reference users accepted by object ID or user principal name
 - Explicit groups accepted by object ID or exact display name
 - Editable named group sets such as `HR` and `IT`, selectable with `-ManualGroupSet`
+- Pattern-filtered, multi-select group browser using `Out-GridView`
 - Direct membership comparison, without flattening inherited/nested memberships
 - Dynamic groups excluded from the assigned-group delta
 - Per-group review with `-Compare`, or automatic delta processing with `-AddAll`
@@ -33,6 +34,8 @@ process only the direct assigned-group membership delta.
   - `GroupMember.ReadWrite.All`
 - A signed-in account that can update the selected groups, such as a group owner or a user
   with a supported Microsoft Entra role
+- A Windows Desktop session for `-BrowseGroups`; `Out-GridView` is unavailable on Server
+  Core, Nano Server, and non-Windows platforms
 
 Install the required module if needed:
 
@@ -90,6 +93,42 @@ deduplicated:
     -ManualGroupSet HR,IT `
     -WhatIf
 ```
+
+Configure the default GUI browser patterns in the `GROUP BROWSER PATTERNS` section near the
+top of the script. Matching is case-insensitive, and standard PowerShell wildcards are
+supported:
+
+```powershell
+$script:GroupBrowserPatterns = @(
+    'User.app-*'
+    'User.sso-*'
+)
+```
+
+Open the browser using those configured patterns:
+
+```powershell
+.\Set-UserAccessPackage.ps1 `
+    -UserId new.user@contoso.com `
+    -BrowseGroups
+```
+
+Use Ctrl or Shift to select multiple rows and click **OK**. The window contains only groups
+that match at least one pattern, are eligible for direct Graph membership changes, and do
+not already contain the target as a direct member.
+
+Override the configured patterns for one run:
+
+```powershell
+.\Set-UserAccessPackage.ps1 `
+    -UserId new.user@contoso.com `
+    -BrowseGroups `
+    -GroupPattern 'User.app-*','User.sso-*' `
+    -WhatIf
+```
+
+A value without wildcard characters is treated as a prefix, so `-GroupPattern User.app-`
+is equivalent to `-GroupPattern User.app-*`.
 
 Compare a user with a reference user and approve each eligible delta group:
 

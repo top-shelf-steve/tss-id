@@ -6,7 +6,8 @@ membership delta from another user.
 .DESCRIPTION
 Uses Microsoft Graph v1.0 to add one target user to Microsoft Entra groups. Run the script
 without parameters for an interactive menu, specify one or more groups directly, select a
-named manual group set configured in this file, or compare the target with a reference user.
+named manual group set configured in this file, browse groups by configured or supplied
+display-name patterns in a GUI, or compare the target with a reference user.
 
 Comparison mode reads direct group membership only. Groups with DynamicMembership in
 groupTypes are not candidates because their membership is rule controlled. The delta is the
@@ -30,6 +31,15 @@ Comma- and semicolon-separated values are also accepted.
 .PARAMETER ManualGroupSet
 One or more named group sets from the editable ManualGroupSets section near the top of this
 file. For example, -ManualGroupSet HR or -ManualGroupSet HR,IT.
+
+.PARAMETER BrowseGroups
+Opens an Out-GridView window containing eligible groups whose display names match the
+configured or supplied patterns. Select one or more rows and click OK to process them.
+
+.PARAMETER GroupPattern
+One or more case-insensitive wildcard patterns used by -BrowseGroups. Values without a
+wildcard are treated as prefixes by appending *. When omitted, the editable
+GroupBrowserPatterns section near the top of this file is used.
 
 .PARAMETER CompareUserId
 Object ID or user principal name of the reference user whose direct assigned groups are
@@ -63,6 +73,16 @@ Adds the target user to two explicitly selected groups.
 Adds the target user to every eligible group configured in the HR manual group set.
 
 .EXAMPLE
+.\Set-UserAccessPackage.ps1 -UserId new.user@contoso.com -BrowseGroups
+
+Opens the group-selection GUI using the patterns configured in this file.
+
+.EXAMPLE
+.\Set-UserAccessPackage.ps1 -UserId new.user@contoso.com -BrowseGroups -GroupPattern 'User.app-*','User.sso-*'
+
+Opens the group-selection GUI using patterns supplied for this run.
+
+.EXAMPLE
 .\Set-UserAccessPackage.ps1 -UserId new.user@contoso.com -CompareUserId template.user@contoso.com -Compare
 
 Shows each eligible assigned-group delta and asks whether it should be added.
@@ -85,6 +105,7 @@ selected groups, such as being a group owner or holding a supported Microsoft En
 param(
     [Parameter(Mandatory, ParameterSetName = 'Manual', Position = 0)]
     [Parameter(Mandatory, ParameterSetName = 'ManualGroupSet', Position = 0)]
+    [Parameter(Mandatory, ParameterSetName = 'GroupBrowser', Position = 0)]
     [Parameter(Mandatory, ParameterSetName = 'CompareReview', Position = 0)]
     [Parameter(Mandatory, ParameterSetName = 'CompareAll', Position = 0)]
     [ValidateNotNullOrEmpty()]
@@ -99,6 +120,14 @@ param(
     [Alias('GroupSet')]
     [ValidateNotNullOrEmpty()]
     [string[]]$ManualGroupSet,
+
+    [Parameter(Mandatory, ParameterSetName = 'GroupBrowser')]
+    [switch]$BrowseGroups,
+
+    [Parameter(ParameterSetName = 'GroupBrowser')]
+    [Alias('Pattern')]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$GroupPattern,
 
     [Parameter(Mandatory, ParameterSetName = 'CompareReview', Position = 1)]
     [Parameter(Mandatory, ParameterSetName = 'CompareAll', Position = 1)]
@@ -151,11 +180,26 @@ $script:ManualGroupSets = [ordered]@{
 # END MANUAL GROUP SETS
 # -----------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------------
+# GROUP BROWSER PATTERNS - EDIT THIS SECTION
+#
+# These case-insensitive wildcard patterns populate the -BrowseGroups GUI when
+# -GroupPattern is not supplied. A value without wildcard characters is treated as a prefix.
+# -----------------------------------------------------------------------------
+$script:GroupBrowserPatterns = @(
+    'User.app-*'
+    'User.sso-*'
+)
+# -----------------------------------------------------------------------------
+# END GROUP BROWSER PATTERNS
+# -----------------------------------------------------------------------------
+
 $script:GraphBaseUri = 'https://graph.microsoft.com/v1.0'
 $script:RunStarted = Get-Date
 $script:ConnectedByScript = $false
 $script:Results = New-Object 'System.Collections.Generic.List[object]'
 $script:SelectedManualGroupSets = @()
+$script:SelectedGroupBrowserPatterns = @()
 
 function Write-Log {
     [CmdletBinding()]
@@ -467,6 +511,7 @@ function Add-RunResult {
         Timestamp                 = (Get-Date).ToString('o')
         Mode                      = $Mode
         ManualGroupSets           = if ($script:SelectedManualGroupSets.Count -gt 0) { $script:SelectedManualGroupSets -join '; ' } else { $null }
+        GroupBrowserPatterns      = if ($script:SelectedGroupBrowserPatterns.Count -gt 0) { $script:SelectedGroupBrowserPatterns -join '; ' } else { $null }
         TargetUserId              = if ($null -ne $TargetUser) { [string]$TargetUser.id } else { $null }
         TargetUserPrincipalName   = if ($null -ne $TargetUser) { [string]$TargetUser.userPrincipalName } else { $null }
         ReferenceUserId           = if ($null -ne $ReferenceUser) { [string]$ReferenceUser.id } else { $null }
@@ -491,11 +536,12 @@ function Show-InteractiveMenu {
     Write-Host ''
     Write-Host '  1. Add a user to one or more specified groups'
     Write-Host '  2. Add a user using a configured manual group set'
-    Write-Host '  3. Compare with another user and review each group'
-    Write-Host '  4. Compare with another user and add the entire eligible delta'
+    Write-Host '  3. Browse matching groups in a GUI and select one or more'
+    Write-Host '  4. Compare with another user and review each group'
+    Write-Host '  5. Compare with another user and add the entire eligible delta'
     Write-Host ''
 
-    $selection = Read-Host 'Choose 1-4'
+    $selection = Read-Host 'Choose 1-5'
     $script:UserId = Read-Host 'Target user object ID or user principal name'
     if ([string]::IsNullOrWhiteSpace($script:UserId)) {
         throw 'A target user is required.'
@@ -526,13 +572,26 @@ function Show-InteractiveMenu {
             return 'ManualGroupSet'
         }
         '3' {
+            Write-Host ''
+            Write-Host 'Configured group browser patterns' -ForegroundColor Cyan
+            foreach ($configuredBrowserPattern in $script:GroupBrowserPatterns) {
+                Write-Host "  $configuredBrowserPattern"
+            }
+            $patternChoice = Read-Host 'Press Enter to use these patterns, or enter replacement patterns separated by commas or semicolons'
+            if (-not [string]::IsNullOrWhiteSpace($patternChoice)) {
+                $script:GroupPattern = @($patternChoice -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            }
+            $script:BrowseGroups = $true
+            return 'GroupBrowser'
+        }
+        '4' {
             $script:CompareUserId = Read-Host 'Reference user object ID or user principal name'
             if ([string]::IsNullOrWhiteSpace($script:CompareUserId)) {
                 throw 'A reference user is required.'
             }
             return 'CompareReview'
         }
-        '4' {
+        '5' {
             $script:CompareUserId = Read-Host 'Reference user object ID or user principal name'
             if ([string]::IsNullOrWhiteSpace($script:CompareUserId)) {
                 throw 'A reference user is required.'
@@ -540,7 +599,7 @@ function Show-InteractiveMenu {
             return 'CompareAll'
         }
         default {
-            throw "'$selection' is not valid. Run the script again and choose 1, 2, 3, or 4."
+            throw "'$selection' is not valid. Run the script again and choose 1, 2, 3, 4, or 5."
         }
     }
 }
@@ -595,6 +654,127 @@ function Resolve-ManualGroupSetSelection {
     }
 
     return $uniqueGroupIdentities
+}
+
+function ConvertTo-GroupBrowserPatterns {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string[]]$Value)
+
+    $normalizedPatterns = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($rawPattern in @(ConvertTo-IdentityList -Identity $Value)) {
+        $normalizedPattern = $rawPattern
+        if ($normalizedPattern -notmatch '[*?\[]') {
+            $normalizedPattern = "$normalizedPattern*"
+        }
+        $normalizedPatterns.Add($normalizedPattern)
+    }
+
+    return @($normalizedPatterns.ToArray() | Select-Object -Unique)
+}
+
+function Get-AllDirectoryGroups {
+    [CmdletBinding()]
+    param()
+
+    $select = 'id,displayName,description,groupTypes,mail,mailEnabled,securityEnabled,isAssignableToRole,onPremisesSyncEnabled'
+    $uri = "$script:GraphBaseUri/groups?%24select=$select&%24top=999"
+    return @(Get-GraphCollection -Uri $uri)
+}
+
+function Select-GroupsFromBrowser {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$TargetUser,
+        [Parameter(Mandatory)][hashtable]$TargetGroupIds,
+        [Parameter(Mandatory)][string[]]$Pattern
+    )
+
+    if (-not (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
+        throw 'Group browser mode requires Out-GridView and a Windows Desktop session. Run the script from Windows PowerShell or PowerShell 7 on Windows with Desktop Experience.'
+    }
+
+    $normalizedPatterns = @(ConvertTo-GroupBrowserPatterns -Value $Pattern)
+    if ($normalizedPatterns.Count -eq 0) {
+        throw 'At least one non-empty group browser pattern is required.'
+    }
+    $script:SelectedGroupBrowserPatterns = $normalizedPatterns
+    Write-Log -Level STEP -Message "Retrieving directory groups for browser pattern(s): $($normalizedPatterns -join ', ')."
+
+    $directoryGroups = @(Get-AllDirectoryGroups)
+    $matchingGroups = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($directoryGroup in $directoryGroups) {
+        foreach ($normalizedPattern in $normalizedPatterns) {
+            if ([string]$directoryGroup.displayName -like $normalizedPattern) {
+                $matchingGroups.Add($directoryGroup)
+                break
+            }
+        }
+    }
+
+    $browserRows = New-Object 'System.Collections.Generic.List[object]'
+    $eligibleGroupLookup = @{}
+    $alreadyMemberCount = 0
+    $ineligibleCount = 0
+    foreach ($matchingGroup in $matchingGroups.ToArray()) {
+        if ($TargetGroupIds.ContainsKey([string]$matchingGroup.id)) {
+            $alreadyMemberCount++
+            continue
+        }
+
+        $eligibility = Get-GroupEligibility -Group $matchingGroup
+        if (-not $eligibility.Eligible) {
+            $ineligibleCount++
+            continue
+        }
+
+        $eligibleGroupLookup[[string]$matchingGroup.id] = $matchingGroup
+        $browserRows.Add([pscustomobject][ordered]@{
+            DisplayName = [string]$matchingGroup.displayName
+            Type        = [string]$eligibility.Kind
+            Description = [string]$matchingGroup.description
+            Mail        = [string]$matchingGroup.mail
+            ObjectId    = [string]$matchingGroup.id
+        })
+    }
+
+    Write-Host ''
+    Write-Host 'Group browser summary' -ForegroundColor Cyan
+    Write-Host "  Directory groups retrieved: $($directoryGroups.Count)"
+    Write-Host "  Pattern matches:             $($matchingGroups.Count)"
+    Write-Host "  Already a direct member:     $alreadyMemberCount"
+    Write-Host "  Ineligible groups hidden:    $ineligibleCount"
+    Write-Host "  Available for selection:     $($browserRows.Count)"
+
+    if ($browserRows.Count -eq 0) {
+        Write-Log -Level WARN -Message 'No eligible, unassigned groups match the browser patterns.'
+        return @()
+    }
+
+    $windowTitle = "Select groups for $($TargetUser.displayName) <$($TargetUser.userPrincipalName)> - use Ctrl/Shift for multiple rows"
+    try {
+        $selectedRows = @($browserRows.ToArray() |
+            Sort-Object DisplayName, ObjectId |
+            Out-GridView -Title $windowTitle -OutputMode Multiple)
+    }
+    catch {
+        throw "The group browser window could not be opened: $($_.Exception.Message)"
+    }
+
+    if ($selectedRows.Count -eq 0) {
+        Write-Log -Level INFO -Message 'The group browser was closed without selecting any groups.'
+        return @()
+    }
+
+    $selectedGroups = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($selectedRow in $selectedRows) {
+        $selectedObjectId = [string]$selectedRow.ObjectId
+        if ($eligibleGroupLookup.ContainsKey($selectedObjectId)) {
+            $selectedGroups.Add($eligibleGroupLookup[$selectedObjectId])
+        }
+    }
+
+    Write-Log -Level SUCCESS -Message "Selected $($selectedGroups.Count) group(s) in the browser."
+    return $selectedGroups.ToArray()
 }
 
 function Show-UserSummary {
@@ -762,6 +942,21 @@ try {
                 Write-Log -Level ERROR -Message "Could not resolve group '$identity': $($details.Message)"
                 Add-RunResult -Mode $mode -TargetUser $targetUser -Action 'Resolve' -Status 'Failed' -Message "Could not resolve group '$identity': $($details.Message)"
             }
+        }
+    }
+    elseif ($mode -eq 'GroupBrowser') {
+        $browserPatternSelection = if ($null -ne $GroupPattern -and @($GroupPattern).Count -gt 0) {
+            @($GroupPattern)
+        }
+        else {
+            @($script:GroupBrowserPatterns)
+        }
+        if (@($browserPatternSelection).Count -eq 0) {
+            throw 'No group browser patterns are configured. Add patterns to GroupBrowserPatterns or supply -GroupPattern.'
+        }
+
+        foreach ($selectedBrowserGroup in @(Select-GroupsFromBrowser -TargetUser $targetUser -TargetGroupIds $targetGroupIds -Pattern $browserPatternSelection)) {
+            $candidates.Add($selectedBrowserGroup)
         }
     }
     else {
