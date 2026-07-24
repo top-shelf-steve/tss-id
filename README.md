@@ -1,3 +1,98 @@
+# Create External Users
+
+`Create-ExternalUsers.ps1` invites one or more Microsoft Entra B2B guests and can add every
+successfully invited or existing guest to specified groups.
+
+## Features
+
+- Interactive menu for one user, multiple users, or CSV import
+- Parameter-driven single and bulk invitation modes
+- Optional display names and customized Microsoft invitation email text
+- Optional assignment to one or more security or Microsoft 365 groups
+- Groups accepted by object ID or exact display name
+- Existing guest reuse and duplicate-input detection
+- Safety skips for existing member accounts, dynamic groups, role-assignable groups,
+  synchronized groups, mail-enabled read-only groups, and unsupported group types
+- Retry handling, `-WhatIf`, standard PowerShell `-Confirm`, and CSV/JSON result export
+
+## Requirements
+
+- Windows PowerShell 5.1 or PowerShell 7+
+- `Microsoft.Graph.Authentication` module
+- Delegated Microsoft Graph scopes:
+  - `User.Invite.All`
+  - `User.Read.All`
+  - `GroupMember.ReadWrite.All` when groups are supplied
+- Permission under the tenant's external collaboration settings to invite guests
+- Permission to update the selected groups, such as group ownership or a supported Entra
+  role
+
+Install the required module if needed:
+
+```powershell
+Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+```
+
+## Usage
+
+Run interactively:
+
+```powershell
+.\Create-ExternalUsers.ps1
+```
+
+Invite one external user:
+
+```powershell
+.\Create-ExternalUsers.ps1 `
+    -EmailAddress guest@fabrikam.com `
+    -DisplayName 'Fabrikam Guest'
+```
+
+Invite several users and add each of them to specified groups. Groups can be supplied by
+object ID or exact display name:
+
+```powershell
+.\Create-ExternalUsers.ps1 `
+    -EmailAddresses guest1@fabrikam.com,guest2@adatum.com `
+    -GroupId 'External App Users','Project Alpha' `
+    -Force
+```
+
+Preview a CSV import and group assignments:
+
+```powershell
+.\Create-ExternalUsers.ps1 `
+    -CsvPath .\ExternalUsers.csv `
+    -GroupId 11111111-1111-1111-1111-111111111111 `
+    -WhatIf `
+    -NoExportPrompt
+```
+
+The CSV needs an `EmailAddress` column and can include `DisplayName`:
+
+```csv
+EmailAddress,DisplayName
+guest1@fabrikam.com,Fabrikam Guest
+guest2@adatum.com,Adatum Guest
+```
+
+`InvitedUserEmailAddress` and `Mail` are also accepted as email-column names. Invalid rows
+are recorded as failures while valid rows continue.
+
+Microsoft Graph sends the invitation email by default. Use
+`-DoNotSendInvitationMessage` to suppress it; the returned redemption URL is then shown in
+the terminal and retained in result exports. Use `-InviteRedirectUrl` to change the page
+shown after redemption, and `-CustomizedMessageBody` or `-MessageLanguage` to customize the
+Microsoft invitation message.
+
+When an email matches an existing Entra guest, the existing guest object is reused for
+group assignments without sending another invitation. If it matches an internal `Member`
+account, the entry is skipped. Use `-ExportPath C:\Reports` for an automatic timestamped
+CSV, or specify a `.json` filename for JSON.
+
+---
+
 # Set User Group Access
 
 `Set-UserAccessPackage.ps1` is an ad hoc Microsoft Entra group-membership utility for
